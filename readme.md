@@ -2,7 +2,9 @@
 
 this will become a library in the future for use in the WIP slopless web search engine
 
-slopless will mainly use traditional search techniques, but vector search would be great to enhance certain queries
+slopless will mainly use traditional search techniques, but vector search would be great to enhance certain queries.
+
+this will also greatly enhance cross-language search which is a priority for slopless.
 
 # classifier models to try
 * https://huggingface.co/MongoDB/mdbr-leaf-ir (en)
