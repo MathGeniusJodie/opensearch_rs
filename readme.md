@@ -1,6 +1,6 @@
 # toy example of fast/small vector embedding running on the cpu
 
-this will become a library in the future for use in the WIP slopless web search engine
+this will become a library in the future for use in the WIP [slopless](https://github.com/MathGeniusJodie/slopless) web search engine
 
 slopless will mainly use traditional search techniques, but vector search would be great to enhance certain queries.
 
