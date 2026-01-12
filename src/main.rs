@@ -1,5 +1,6 @@
 use anyhow::Context;
 use anyhow::Result;
+use candle_core::quantized;
 use embed_anything::embeddings;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -172,210 +173,122 @@ Represent this sentence for searching relevant passages: Who is my dad?";
         if max == 0.0 {
             max = 1.0;
         }
-        emb[..256].iter().map(|&f| f / max).collect::<Vec<_>>()
-    }).collect::<Vec<_>>();
-    let output  = output.iter().cloned().map(|emb| {
-        let emb = emb.iter().map(|&f| (f*7.0).round() as i8).collect::<Vec<i8>>();
-        emb
-    }).collect::<Vec<Vec<i8>>>();
+        const RCP_MAX_I4_F32: f32 = 1.0/7.0;
+        let norm = max*RCP_MAX_I4_F32;
+        let quantised = emb[..256]
+            .iter()
+            .map(|&f| f / norm + 8.0)
+            .map(|f| f.round() as u8)
+            .collect::<Vec<_>>();
 
-    for (i, embeddings) in output.iter().enumerate() {
+        let quantized_i4: Vec<u8> = quantised.chunks(2).map(|chunk| {
+            (chunk[0] << 4) | chunk[1]
+        }).collect();
+
+        let length = quantised.iter().map(|&x| (x as f32 -8.0).powi(2)).sum::<f32>().sqrt();
+        let norm = 1.0 / length;
+        (quantized_i4,norm)
+    }).collect::<Vec<_>>();
+
+    for (i, (embeddings,_)) in output.iter().enumerate() {
         eprintln!("Embeddings {i}: {:?} Length: {}", &embeddings, embeddings.len());
         eprintln!();
     }
-/*
-    let output  = output.iter().cloned().map(|emb| {
-        let emb = emb.iter().map(|&f| f as f32).collect::<Vec<_>>();
-        normalize(&emb)
-    }).collect::<Vec<_>>();
-*/
+
     for (i, embeddings) in output.iter().enumerate() {
         // calc distance to last embedding
-        let dist = cosine_distance_groundtruth(embeddings, output.last().unwrap());
+        let dist = cosine_distance_groundtruth(
+            (&embeddings.0[..], embeddings.1),
+            (&output.last().unwrap().0[..], output.last().unwrap().1),
+        );
         if dist<0.1 {
             continue;
         }
         let text = prompt_lines.clone().nth(i).unwrap_or("");
         eprintln!("Distance of Embeddings {text} to last: {}", dist);
     }
-    let i4_table: [i8;16] = [0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1];
-    let mut mul_table:Vec<i8> = Vec::with_capacity(256);
-    for i in 0..16 {
-        for j in 0..16 {
-            mul_table.push(i4_table[i] * i4_table[j]);
-        }
-    }
-    // print the mul_table as binary digits
-    for i in 0..16 {
-        for j in 0..16 {
-            let val = mul_table[i*16 + j];
-            print!("{:3},", val);
-        }
-        println!();
-    }
     Ok(())
 }
 
-fn cosine_distance_groundtruth(a: &[i8], b: &[i8]) -> f32 {
-    let mut dot_product = 0.0;
-    let mut norm_a = 0.0;
-    let mut norm_b = 0.0;
-
-    for (&val_a, &val_b) in a.iter().zip(b.iter()) {
-        dot_product += (val_a as f32) * (val_b as f32);
-        norm_a += (val_a as f32).powi(2);
-        norm_b += (val_b as f32).powi(2);
-    }
-
-    let norm_a = 1.0 / norm_a.sqrt();
-    let norm_b = 1.0 / norm_b.sqrt();
-
+fn cosine_distance_groundtruth((a_i4, norm_a):(&[u8],f32), (b_i4,norm_b):(&[u8],f32)) -> f32 {
+    let dot_product = unsafe {
+        dot_i4_256_nibbles_unrolled(
+            a_i4.as_ptr(),
+            b_i4.as_ptr(),
+        ) as f32
+    };
     dot_product * norm_a * norm_b
 }
 
-fn cosine_distance_i4(a: &[i8], b: &[i8]) -> f32 {
-    let mut dot_product = 0.0;
-    let mut norm_a = 0.0;
-    let mut norm_b = 0.0;
-
-    for (&val_a, &val_b) in a.iter().zip(b.iter()) {
-        dot_product += (val_a as f32) * (val_b as f32);
-        norm_a += (val_a as f32).powi(2);
-        norm_b += (val_b as f32).powi(2);
-    }
-    // we should precompute these
-    let norm_a = 1.0 / norm_a.sqrt();
-    let norm_b = 1.0 / norm_b.sqrt();
-
-    let i4_table: [i8;16] = [0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1];
-    let mut mul_table:Vec<i8> = Vec::with_capacity(256);
-    for i in 0..16 {
-        for j in 0..16 {
-            mul_table.push(i4_table[i] * i4_table[j]);
-        }
-    }
-    1.0
-}
-
 use std::arch::x86_64::*;
 
 #[target_feature(enable = "avx2")]
-unsafe fn dot_i4_optimized(a: __m256i, b: __m256i) -> __m256i {
-    // 1. Precompute constants (Hoist these out if calling in a loop)
-    // 0x88 (-120) adds 8 to each nibble: [-8, 7] -> [0, 15]
-    let xor_bias = _mm256_set1_epi8(0x88_u8 as i8); 
-    let mask_low = _mm256_set1_epi8(0x0F);
-    let eights = _mm256_set1_epi8(8);
-    
-    // 2. Bias inputs to convert Signed-4bit to Unsigned-4bit (0..15)
-    // We assume inputs are packed 4-bit (two per byte).
-    let a_u = _mm256_xor_si256(a, xor_bias);
-    let b_u = _mm256_xor_si256(b, xor_bias);
-
-    // 3. Unpack Low/High nibbles
-    // AND is port 0/1/5, Shifts are port 0/1. 
-    // We interleave instructions to allow better pipelining.
-    let a_lo = _mm256_and_si256(a_u, mask_low);
-    let b_lo = _mm256_and_si256(b_u, mask_low);
-    
-    // Note: srli_epi16 operates on 16-bit lanes. 
-    // It shifts [H1 L1 H0 L0] -> [0 H1 L1 H0]. 
-    // We mask immediately to isolate the nibbles.
-    let a_hi = _mm256_and_si256(_mm256_srli_epi16(a_u, 4), mask_low);
-    let b_hi = _mm256_and_si256(_mm256_srli_epi16(b_u, 4), mask_low);
-
-    // 4. Main Term: (a+8)*(b+8)
-    // maddubs performs: (u8 * i8) + (u8 * i8) -> i16 saturated
-    // Since our inputs are 0..15, they fit in both u8 and i8 ranges.
-    // Result is Sum( (a+8)(b+8) )
-    let term_lo = _mm256_maddubs_epi16(a_lo, b_lo);
-    let term_hi = _mm256_maddubs_epi16(a_hi, b_hi);
-    
-    // 5. Correction Term: 8 * Sum(a+8 + b+8)
-    // Optimization: Calculate sum of nibbles first.
-    // Max sum per byte = 15+15+15+15 = 60 (Fits safely in i8)
-    let sum_a = _mm256_add_epi8(a_lo, a_hi);
-    let sum_b = _mm256_add_epi8(b_lo, b_hi);
-    let sum_biased = _mm256_add_epi8(sum_a, sum_b);
-    
-    // We use maddubs by 1 to effectively widen i8 sum to i16 without separate unpacks,
-    // then shift left by 3 (multiply by 8).
-    // Or simply maddubs by 8 directly.
-    let correction = _mm256_maddubs_epi16(sum_biased, eights);
-
-    // 6. Final Assembly
-    // Algebra: 
-    // Term = Sum( (a+8)(b+8) ) = Sum( ab + 8a + 8b + 64 )
-    // Corr = Sum( 8(a+8 + b+8) ) = Sum( 8a + 8b + 128 )
-    // Term - Corr = Sum( ab - 64 )
-    // Since maddubs sums PAIRS of products, we effectively subtracted 64*2 = 128 per lane.
-    // We must add 128 back.
-    
-    let term_total = _mm256_add_epi16(term_lo, term_hi);
-    let diff = _mm256_sub_epi16(term_total, correction);
-    
-    // Combine 128 offset addition.
-    _mm256_add_epi16(diff, _mm256_set1_epi16(128))
-}
-
-
-use std::arch::x86_64::*;
-
-#[target_feature(enable = "avx2")]
-pub unsafe fn dot_i4_optimized_v2(a: __m256i, b: __m256i) -> __m256i {
+pub unsafe fn dot_i4_256_nibbles_unrolled(a_ptr: *const u8, b_ptr: *const u8) -> i32 {
     // 1. Constants
-    // mask: Selects lower nibbles (0x0F)
     let mask = _mm256_set1_epi8(0x0F);
+    let sub_bias = _mm256_set1_epi8(0x08);
+
+    // 2. Accumulators
+    // acc_dot stores the main product sums (16 x i16)
+    let mut acc_dot = _mm256_setzero_si256();
+    // acc_a_sum stores the sum of 'A' weights for correction (32 x i8)
+    // We can use i8 because 4 iterations of range [-16, 14] will not overflow i8.
+    let mut acc_a_sum = _mm256_setzero_si256();
+
+    // 3. Fully Unrolled Execution (4 steps of 32 bytes)
+    // Using a macro here just to keep the code DRY, but it effectively inlines 4 times.
+    for i in 0..4 {
+        let a = _mm256_loadu_si256(a_ptr.add(i * 32) as *const __m256i);
+        let b = _mm256_loadu_si256(b_ptr.add(i * 32) as *const __m256i);
+
+        //turn i4 to u8
+        //let xor_bias = _mm256_set1_epi8(-120); // 0x88
+        //let a = _mm256_xor_si256(a, xor_bias);
+        //let b = _mm256_xor_si256(b, xor_bias);
+
+        // Split Nibbles
+        // A_lo: ((a & mask) - 8)
+        let a_lo = _mm256_sub_epi8(_mm256_and_si256(a, mask), sub_bias);
+        // B_lo: (b & mask) -> represents (B_real + 8)
+        let b_lo = _mm256_and_si256(b, mask);
+        
+        // High nibbles
+        let a_hi_shifted = _mm256_srli_epi16(a, 4);
+        let b_hi_shifted = _mm256_srli_epi16(b, 4);
+        let a_hi = _mm256_sub_epi8(_mm256_and_si256(a_hi_shifted, mask), sub_bias);
+        let b_hi = _mm256_and_si256(b_hi_shifted, mask);
+
+        // Main Dot Product (expensive part)
+        let dot_lo = _mm256_maddubs_epi16(b_lo, a_lo);
+        let dot_hi = _mm256_maddubs_epi16(b_hi, a_hi);
+        
+        // Accumulate main dot product
+        acc_dot = _mm256_add_epi16(acc_dot, _mm256_add_epi16(dot_lo, dot_hi));
+
+        // Lazy Correction Accumulation (Cheap part)
+        // Just add the raw i8 A-values. We multiply by 8 later.
+        // Note: We combine lo/hi immediately to save an add operation on the accumulator
+        let sum_a_iter = _mm256_add_epi8(a_lo, a_hi);
+        acc_a_sum = _mm256_add_epi8(acc_a_sum, sum_a_iter);
+    }
+
+    // 4. Finalize Correction
+    // Now we do the expensive multiplication just once for the whole block.
+    // Correction = 8 * sum(A)
+    let correction = _mm256_maddubs_epi16(sub_bias, acc_a_sum);
     
-    // xor_bias: 0x88 (0x80 | 0x08)
-    // - Toggles MSB (0x80) for sign extension prep.
-    // - Toggles nibble MSB (0x08) for offset prep.
-    let xor_bias = _mm256_set1_epi8(-120); // 0x88 as i8
+    // Apply correction: result = dot - correction
+    let final_vec = _mm256_sub_epi16(acc_dot, correction);
+
+    // 5. Horizontal Sum (Same as before)
+    let ones = _mm256_set1_epi16(1);
+    let vec_i32 = _mm256_madd_epi16(final_vec, ones);
     
-    // sub_bias: 8
-    // We can derive this to save a register load if register pressure is high in the calling loop.
-    // In isolation, the compiler handles this, but explicit reuse ensures we don't waste a register.
-    let sub_bias = _mm256_and_si256(xor_bias, mask); // Results in 0x08
-
-    // 2. Pre-process inputs (The "0x88" Trick)
-    // This flips the sign bit and the 4-bit MSB simultaneously for both nibbles.
-    let a_prep = _mm256_xor_si256(a, xor_bias);
-    let b_prep = _mm256_xor_si256(b, xor_bias);
-
-    // 3. Low Nibbles
-    // A: Sign-extend 4-bit to 8-bit. 
-    // Logic: ((a_nib ^ 8) - 8) effectively extends the sign.
-    let a_lo = _mm256_sub_epi8(_mm256_and_si256(a_prep, mask), sub_bias);
+    let hi_128 = _mm256_extracti128_si256(vec_i32, 1);
+    let lo_128 = _mm256_castsi256_si128(vec_i32);
+    let sum_128 = _mm_add_epi32(lo_128, hi_128);
+    let sum_64 = _mm_hadd_epi32(sum_128, sum_128);
+    let sum_32 = _mm_hadd_epi32(sum_64, sum_64);
     
-    // B: Convert to unsigned 0..15 range (biased by +8).
-    // Logic: (b_nib ^ 8). We effectively compute (B_real + 8).
-    let b_lo = _mm256_and_si256(b_prep, mask);
-
-    // 4. High Nibbles (Interleaved to allow pipelining)
-    // Shift right by 4 bits. Note: srli_epi16 shifts 16-bit words, but since we mask 
-    // immediately with 0x0F, cross-byte boundary bits are cleaned up correctly.
-    let a_hi_shifted = _mm256_srli_epi16(a_prep, 4);
-    let b_hi_shifted = _mm256_srli_epi16(b_prep, 4);
-
-    let a_hi = _mm256_sub_epi8(_mm256_and_si256(a_hi_shifted, mask), sub_bias);
-    let b_hi = _mm256_and_si256(b_hi_shifted, mask);
-
-    // 5. Compute Dot Product and Correction
-    // We are computing: sum( A_real * (B_real + 8) )
-    // Expansion:        sum( A_real * B_real ) + 8 * sum( A_real )
-    
-    // Main MAC (Multiply Accumulate)
-    // maddubs: Multiplies unsigned u8 (B) with signed i8 (A) and adds adjacent pairs.
-    let dot_lo = _mm256_maddubs_epi16(b_lo, a_lo);
-    let dot_hi = _mm256_maddubs_epi16(b_hi, a_hi);
-    let dot_combined = _mm256_add_epi16(dot_lo, dot_hi);
-
-    // Correction Term: 8 * sum( A_real )
-    // Optimization: Add low/high A first, then multiply by 8 once.
-    let a_sum = _mm256_add_epi8(a_lo, a_hi);
-    let correction = _mm256_maddubs_epi16(sub_bias, a_sum); // bias(8) * sum(A)
-
-    // 6. Final Result
-    // sum(A*B) = (sum(A*B) + 8*sum(A)) - 8*sum(A)
-    _mm256_sub_epi16(dot_combined, correction)
+    _mm_cvtsi128_si32(sum_32)
 }
