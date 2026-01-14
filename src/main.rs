@@ -6,12 +6,28 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::context::params::LlamaPoolingType;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
 use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
 use llama_cpp_2::model::{AddBos, Special};
+use qdrant_client::Qdrant;
+use qdrant_client::qdrant::CompressionRatio;
+use qdrant_client::qdrant::CreateCollectionBuilder;
+use qdrant_client::qdrant::HnswConfigDiff;
+use qdrant_client::qdrant::ProductQuantizationBuilder;
+use qdrant_client::qdrant::SearchPointsBuilder;
+use qdrant_client::qdrant::UpsertPointsBuilder;
+use qdrant_client::qdrant::quantization_config::Quantization;
 use std::error::Error;
 use std::io::Write;
 use std::num::NonZero;
+
+use qdrant_client::prelude::*;
+use qdrant_client::qdrant::{
+    Distance, QuantizationConfig, QuantizationType, VectorParams, VectorsConfig,
+    vectors_config::Config,
+};
+use std::collections::HashMap;
+use tokio;
 
 fn normalize(input: &[f32]) -> Vec<f32> {
     let magnitude = input
@@ -26,7 +42,7 @@ fn batch_decode(
     ctx: &mut LlamaContext,
     batch: &mut LlamaBatch,
     s_batch: i32,
-    output: &mut Vec<Vec<f32>>
+    output: &mut Vec<Vec<f32>>,
 ) -> Result<()> {
     ctx.clear_kv_cache();
     ctx.decode(batch).with_context(|| "llama_decode() failed")?;
@@ -44,18 +60,24 @@ fn batch_decode(
 
     Ok(())
 }
-fn main() -> Result<(), Box<dyn Error>> {
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let backend = LlamaBackend::init()?;
     let model_params = LlamaModelParams::default();
-    let model = LlamaModel::load_from_file(&backend, "/home/jodie/opensearch_rs/mdbr-leaf-ir-q8_0.gguf", &model_params)?;
+    let model = LlamaModel::load_from_file(
+        &backend,
+        "/home/jodie/opensearch_rs/mdbr-leaf-ir-q8_0.gguf",
+        &model_params,
+    )?;
     //let model = LlamaModel::load_from_file(&backend, "/home/jodie/opensearch_rs/granite-embedding-english-r2.Q6_K.gguf", &model_params)?;
     let ctx_params = LlamaContextParams::default()
         .with_n_threads_batch(std::thread::available_parallelism()?.get().try_into()?)
         .with_embeddings(true)
         .with_n_seq_max(32)
         .with_n_threads(std::thread::available_parallelism()?.get().try_into()?)
-        .with_n_ctx(Some(NonZero::new(512*32).unwrap()));
-        //.with_pooling_type(LlamaPoolingType::Mean);
+        .with_n_ctx(Some(NonZero::new(512 * 32).unwrap()));
+    //.with_pooling_type(LlamaPoolingType::Mean);
 
     let mut ctx = model
         .new_context(&backend, ctx_params)
@@ -80,6 +102,8 @@ May the worlds we conjure tonight be the ones we build tomorrow. \n\
 Your dad is Jerry.\n\
 I am dad.\n\
 I am father\n\
+Your mom i jane\n\
+Your mother is dad\n\
 My father was a carpenter\n\
 My father is John Smith\n\
 To be, or not to be, that is the question.\n\
@@ -89,7 +113,8 @@ Represent this sentence for searching relevant passages: Who is my dad?";
 
     let time = std::time::Instant::now();
     // tokenize the prompt
-    let tokens_lines_list = prompt_lines.clone()
+    let tokens_lines_list = prompt_lines
+        .clone()
         .map(|line| model.str_to_token(line, AddBos::Always))
         .collect::<Result<Vec<_>, _>>()
         .with_context(|| format!("failed to tokenize {prompt}"))?;
@@ -103,7 +128,11 @@ Represent this sentence for searching relevant passages: Who is my dad?";
     if tokens_lines_list.iter().any(|tok| n_ctx < tok.len()) {
         println!(
             "Warning: prompt length exceeds model context size ({} > {})",
-            tokens_lines_list.iter().map(|tok| tok.len()).max().unwrap_or(0),
+            tokens_lines_list
+                .iter()
+                .map(|tok| tok.len())
+                .max()
+                .unwrap_or(0),
             n_ctx
         );
         return Ok(());
@@ -148,7 +177,7 @@ Represent this sentence for searching relevant passages: Who is my dad?";
     let time = std::time::Instant::now();
     let mut output = Vec::with_capacity(tokens_lines_list.len());
     let mut batch = LlamaBatch::new(n_ctx, tokens_lines_list.len() as i32);
-    for (i,tokens) in tokens_lines_list.iter().enumerate() {
+    for (i, tokens) in tokens_lines_list.iter().enumerate() {
         batch.add_sequence(tokens, i as i32, false)?;
     }
     batch_decode(
@@ -159,39 +188,122 @@ Represent this sentence for searching relevant passages: Who is my dad?";
     )?;
     eprintln!("Batch embedding computation took {:?}", time.elapsed());
 
-    // 4 bit quantization simulation
-    let output  = output.iter().map(|emb| {
-        let mut max = 0.0;
-        for &f in &emb[..256] {
-            if f.abs() > max {
-                max = f.abs();
-            }
-        };
-        if max == 0.0 {
-            max = 1.0;
-        }
-        const RCP_MAX_I4_F32: f32 = 1.0/7.5; // 1.5 for 2 bit quantization is not terrible
-        let norm = max*RCP_MAX_I4_F32;
-        let quantised = emb[..256]
-            .iter()
-            .map(|&f| f / norm + 8.0)
-            .map(|f| f.round() as u8)
-            .collect::<Vec<_>>();
-
-        let quantized_i4: Vec<u8> = quantised.chunks(2).map(|chunk| {
-            (chunk[0] << 4) | chunk[1]
-        }).collect();
-
-        let length = quantised.iter().map(|&x| (x as f32 -8.0).powi(2)).sum::<f32>().sqrt();
-        let norm = 1.0 / length;
-        (quantized_i4,norm)
-    }).collect::<Vec<_>>();
-
-    for (i, (embeddings,_)) in output.iter().enumerate() {
-        eprintln!("Embeddings {i}: {:?} Length: {}", &embeddings, embeddings.len());
-        eprintln!();
+    for emb in output.iter_mut() {
+        emb.truncate(256);
     }
 
+    // Connect to Qdrant (assumes local docker: http://localhost:6333)
+    let client = Qdrant::from_url("http://localhost:6334")
+        .compression(None)
+        .build()?;
+
+    let collection_name = "pq_c_256d";
+
+    let pq_config = ProductQuantizationBuilder::new(CompressionRatio::X64.into()).always_ram(true);
+
+    // Vectors config
+    let vectors = VectorsConfig {
+        config: Some(Config::Params(VectorParams {
+            size: 256,
+            distance: Distance::Cosine.into(),
+            hnsw_config: Some(HnswConfigDiff {
+                m: Some(8), // smaller M for lower memory usage
+                ef_construct: Some(200), // higher ef_construct for better indexing quality
+                full_scan_threshold: None,
+                on_disk: Some(true),
+                ..Default::default()
+            }),
+            quantization_config: Some(QuantizationConfig {
+                quantization: Some(Quantization::Product(pq_config.build())),
+            }),
+            on_disk: Some(true), // store vectors on disk (memmap)
+            ..Default::default()
+        })),
+    };
+
+    client.delete_collection(collection_name).await.ok();
+
+    let response = client
+        .create_collection(
+            CreateCollectionBuilder::new(collection_name)
+                .vectors_config(vectors)
+                //.quantization_config(pq_config),
+        )
+        .await?;
+
+    let info = client.collection_info(collection_name).await?.result.unwrap();
+
+    println!("Collection info: {:?}", info);
+
+    println!("Collection '{}' with PQ-C created!", collection_name);
+    client
+        .upsert_points(UpsertPointsBuilder::new(
+            collection_name,
+            output
+                .iter()
+                .enumerate()
+                .map(|(i, emb)| PointStruct::new(i as u64, normalize(emb), Payload::default()))
+                .collect::<Vec<_>>(),
+        ))
+        .await?;
+
+    let test_search = client
+    .search_points(
+        SearchPointsBuilder::new(collection_name, output.last().unwrap().clone(), 5)
+    )
+    .await?;
+
+    test_search.result.iter().for_each(|res| {
+        println!("Found point ID: {:?} with score: {}", prompt_lines.clone().nth(match res.id.clone().unwrap().point_id_options.unwrap(){
+            qdrant_client::qdrant::point_id::PointIdOptions::Num(id) => id as usize,
+            qdrant_client::qdrant::point_id::PointIdOptions::Uuid(id) => id.parse().unwrap(),
+        }), res.score);
+    });
+
+    // 4 bit quantization simulation
+    let output = output
+        .iter()
+        .map(|emb| {
+            let mut max = 0.0;
+            for &f in &emb[..256] {
+                if f.abs() > max {
+                    max = f.abs();
+                }
+            }
+            if max == 0.0 {
+                max = 1.0;
+            }
+            const RCP_MAX_I4_F32: f32 = 1.0 / 7.5; // 1.5 for 2 bit quantization is not terrible
+            let norm = max * RCP_MAX_I4_F32;
+            let quantised = emb[..256]
+                .iter()
+                .map(|&f| f / norm + 8.0)
+                .map(|f| f.round() as u8)
+                .collect::<Vec<_>>();
+
+            let quantized_i4: Vec<u8> = quantised
+                .chunks(2)
+                .map(|chunk| (chunk[0] << 4) | chunk[1])
+                .collect();
+
+            let length = quantised
+                .iter()
+                .map(|&x| (x as f32 - 8.0).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            let norm = 1.0 / length;
+            (quantized_i4, norm)
+        })
+        .collect::<Vec<_>>();
+/*
+    for (i, (embeddings, _)) in output.iter().enumerate() {
+        eprintln!(
+            "Embeddings {i}: {:?} Length: {}",
+            &embeddings,
+            embeddings.len()
+        );
+        eprintln!();
+    }*/
 
     for (i, embeddings) in output.iter().enumerate() {
         // calc distance to last embedding
@@ -201,11 +313,10 @@ Represent this sentence for searching relevant passages: Who is my dad?";
         b_combined.extend_from_slice(output.last().unwrap().1.to_le_bytes().as_slice());
         let dist = cosine_distance_groundtruth(&a_combined[..], &b_combined[..]);
         let text = prompt_lines.clone().nth(i).unwrap_or("");
-        if dist<0.1 {
+        if dist < 0.1 {
             continue;
         }
-        eprintln!("Distance of Embeddings {text} to last: {}", dist);
-        println!("Length of combined embedding: {}", a_combined.len());
+        eprintln!("Distance of Embeddings {i} {text} to last: {}", dist);
     }
 
     Ok(())
@@ -214,12 +325,7 @@ Represent this sentence for searching relevant passages: Who is my dad?";
 fn cosine_distance_groundtruth(a_i4: &[u8], b_i4: &[u8]) -> f32 {
     let norm_a = f32::from_le_bytes(a_i4[128..132].try_into().unwrap());
     let norm_b = f32::from_le_bytes(b_i4[128..132].try_into().unwrap());
-    let dot_product = unsafe {
-        dot_i4_256_nibbles_unrolled(
-            a_i4.as_ptr(),
-            b_i4.as_ptr(),
-        ) as f32
-    };
+    let dot_product = unsafe { dot_i4_256_nibbles_unrolled(a_i4.as_ptr(), b_i4.as_ptr()) as f32 };
     dot_product * norm_a * norm_b
 }
 
@@ -254,7 +360,7 @@ pub unsafe fn dot_i4_256_nibbles_unrolled(a_ptr: *const u8, b_ptr: *const u8) ->
         let a_lo = _mm256_sub_epi8(_mm256_and_si256(a, mask), sub_bias);
         // B_lo: (b & mask) -> represents (B_real + 8)
         let b_lo = _mm256_and_si256(b, mask);
-        
+
         // High nibbles
         let a_hi_shifted = _mm256_srli_epi16(a, 4);
         let b_hi_shifted = _mm256_srli_epi16(b, 4);
@@ -264,7 +370,7 @@ pub unsafe fn dot_i4_256_nibbles_unrolled(a_ptr: *const u8, b_ptr: *const u8) ->
         // Main Dot Product (expensive part)
         let dot_lo = _mm256_maddubs_epi16(b_lo, a_lo);
         let dot_hi = _mm256_maddubs_epi16(b_hi, a_hi);
-        
+
         // Accumulate main dot product
         acc_dot = _mm256_add_epi16(acc_dot, _mm256_add_epi16(dot_lo, dot_hi));
 
@@ -279,19 +385,19 @@ pub unsafe fn dot_i4_256_nibbles_unrolled(a_ptr: *const u8, b_ptr: *const u8) ->
     // Now we do the expensive multiplication just once for the whole block.
     // Correction = 8 * sum(A)
     let correction = _mm256_maddubs_epi16(sub_bias, acc_a_sum);
-    
+
     // Apply correction: result = dot - correction
     let final_vec = _mm256_sub_epi16(acc_dot, correction);
 
     // 5. Horizontal Sum (Same as before)
     let ones = _mm256_set1_epi16(1);
     let vec_i32 = _mm256_madd_epi16(final_vec, ones);
-    
+
     let hi_128 = _mm256_extracti128_si256(vec_i32, 1);
     let lo_128 = _mm256_castsi256_si128(vec_i32);
     let sum_128 = _mm_add_epi32(lo_128, hi_128);
     let sum_64 = _mm_hadd_epi32(sum_128, sum_128);
     let sum_32 = _mm_hadd_epi32(sum_64, sum_64);
-    
+
     _mm_cvtsi128_si32(sum_32)
 }
