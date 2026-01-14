@@ -13,7 +13,9 @@ use qdrant_client::Qdrant;
 use qdrant_client::qdrant::CompressionRatio;
 use qdrant_client::qdrant::CreateCollectionBuilder;
 use qdrant_client::qdrant::HnswConfigDiff;
+use qdrant_client::qdrant::OptimizersConfigDiff;
 use qdrant_client::qdrant::ProductQuantizationBuilder;
+use qdrant_client::qdrant::SearchParams;
 use qdrant_client::qdrant::SearchPointsBuilder;
 use qdrant_client::qdrant::UpsertPointsBuilder;
 use qdrant_client::qdrant::quantization_config::Quantization;
@@ -199,7 +201,7 @@ Represent this sentence for searching relevant passages: Who is my dad?";
 
     let collection_name = "pq_c_256d";
 
-    let pq_config = ProductQuantizationBuilder::new(CompressionRatio::X64.into()).always_ram(true);
+    let pq_config = ProductQuantizationBuilder::new(CompressionRatio::X32.into()).always_ram(true);
 
     // Vectors config
     let vectors = VectorsConfig {
@@ -209,12 +211,12 @@ Represent this sentence for searching relevant passages: Who is my dad?";
             hnsw_config: Some(HnswConfigDiff {
                 m: Some(8), // smaller M for lower memory usage
                 ef_construct: Some(200), // higher ef_construct for better indexing quality
-                full_scan_threshold: None,
+                full_scan_threshold: Some(1),
                 on_disk: Some(true),
                 ..Default::default()
             }),
             quantization_config: Some(QuantizationConfig {
-                quantization: Some(Quantization::Product(pq_config.build())),
+                quantization: Some(Quantization::Product(pq_config.clone().build())),
             }),
             on_disk: Some(true), // store vectors on disk (memmap)
             ..Default::default()
@@ -227,13 +229,16 @@ Represent this sentence for searching relevant passages: Who is my dad?";
         .create_collection(
             CreateCollectionBuilder::new(collection_name)
                 .vectors_config(vectors)
-                //.quantization_config(pq_config),
+                .quantization_config(pq_config)
+                .optimizers_config(OptimizersConfigDiff {
+                    indexing_threshold: Some(1),
+                    flush_interval_sec: Some(1),
+                    ..Default::default()
+                }),
         )
         .await?;
 
-    let info = client.collection_info(collection_name).await?.result.unwrap();
 
-    println!("Collection info: {:?}", info);
 
     println!("Collection '{}' with PQ-C created!", collection_name);
     client
@@ -249,7 +254,10 @@ Represent this sentence for searching relevant passages: Who is my dad?";
 
     let test_search = client
     .search_points(
-        SearchPointsBuilder::new(collection_name, output.last().unwrap().clone(), 5)
+        SearchPointsBuilder::new(collection_name, output.last().unwrap().clone(), 5).params(SearchParams {
+            hnsw_ef: Some(200),
+            ..Default::default()
+        })
     )
     .await?;
 
@@ -259,6 +267,9 @@ Represent this sentence for searching relevant passages: Who is my dad?";
             qdrant_client::qdrant::point_id::PointIdOptions::Uuid(id) => id.parse().unwrap(),
         }), res.score);
     });
+
+    let info = client.collection_info(collection_name).await?.result.unwrap();
+    println!("Collection info: {:?}", info);
 
     // 4 bit quantization simulation
     let output = output
@@ -320,84 +331,4 @@ Represent this sentence for searching relevant passages: Who is my dad?";
     }
 
     Ok(())
-}
-
-fn cosine_distance_groundtruth(a_i4: &[u8], b_i4: &[u8]) -> f32 {
-    let norm_a = f32::from_le_bytes(a_i4[128..132].try_into().unwrap());
-    let norm_b = f32::from_le_bytes(b_i4[128..132].try_into().unwrap());
-    let dot_product = unsafe { dot_i4_256_nibbles_unrolled(a_i4.as_ptr(), b_i4.as_ptr()) as f32 };
-    dot_product * norm_a * norm_b
-}
-
-use std::arch::x86_64::*;
-
-#[target_feature(enable = "avx2")]
-pub unsafe fn dot_i4_256_nibbles_unrolled(a_ptr: *const u8, b_ptr: *const u8) -> i32 {
-    // 1. Constants
-    let mask = _mm256_set1_epi8(0x0F);
-    let sub_bias = _mm256_set1_epi8(0x08);
-
-    // 2. Accumulators
-    // acc_dot stores the main product sums (16 x i16)
-    let mut acc_dot = _mm256_setzero_si256();
-    // acc_a_sum stores the sum of 'A' weights for correction (32 x i8)
-    // We can use i8 because 4 iterations of range [-16, 14] will not overflow i8.
-    let mut acc_a_sum = _mm256_setzero_si256();
-
-    // 3. Fully Unrolled Execution (4 steps of 32 bytes)
-    // Using a macro here just to keep the code DRY, but it effectively inlines 4 times.
-    for i in 0..4 {
-        let a = _mm256_loadu_si256(a_ptr.add(i * 32) as *const __m256i);
-        let b = _mm256_loadu_si256(b_ptr.add(i * 32) as *const __m256i);
-
-        //turn i4 to u8
-        //let xor_bias = _mm256_set1_epi8(-120); // 0x88
-        //let a = _mm256_xor_si256(a, xor_bias);
-        //let b = _mm256_xor_si256(b, xor_bias);
-
-        // Split Nibbles
-        // A_lo: ((a & mask) - 8)
-        let a_lo = _mm256_sub_epi8(_mm256_and_si256(a, mask), sub_bias);
-        // B_lo: (b & mask) -> represents (B_real + 8)
-        let b_lo = _mm256_and_si256(b, mask);
-
-        // High nibbles
-        let a_hi_shifted = _mm256_srli_epi16(a, 4);
-        let b_hi_shifted = _mm256_srli_epi16(b, 4);
-        let a_hi = _mm256_sub_epi8(_mm256_and_si256(a_hi_shifted, mask), sub_bias);
-        let b_hi = _mm256_and_si256(b_hi_shifted, mask);
-
-        // Main Dot Product (expensive part)
-        let dot_lo = _mm256_maddubs_epi16(b_lo, a_lo);
-        let dot_hi = _mm256_maddubs_epi16(b_hi, a_hi);
-
-        // Accumulate main dot product
-        acc_dot = _mm256_add_epi16(acc_dot, _mm256_add_epi16(dot_lo, dot_hi));
-
-        // Lazy Correction Accumulation (Cheap part)
-        // Just add the raw i8 A-values. We multiply by 8 later.
-        // Note: We combine lo/hi immediately to save an add operation on the accumulator
-        let sum_a_iter = _mm256_add_epi8(a_lo, a_hi);
-        acc_a_sum = _mm256_add_epi8(acc_a_sum, sum_a_iter);
-    }
-
-    // 4. Finalize Correction
-    // Now we do the expensive multiplication just once for the whole block.
-    // Correction = 8 * sum(A)
-    let correction = _mm256_maddubs_epi16(sub_bias, acc_a_sum);
-
-    // Apply correction: result = dot - correction
-    let final_vec = _mm256_sub_epi16(acc_dot, correction);
-
-    // 5. Horizontal Sum (Same as before)
-    let ones = _mm256_set1_epi16(1);
-    let vec_i32 = _mm256_madd_epi16(final_vec, ones);
-
-    let hi_128 = _mm256_extracti128_si256(vec_i32, 1);
-    let lo_128 = _mm256_castsi256_si128(vec_i32);
-    let sum_128 = _mm_add_epi32(lo_128, hi_128);
-    let sum_64 = _mm_hadd_epi32(sum_128, sum_128);
-    let sum_32 = _mm_hadd_epi32(sum_64, sum_64);
-
-    _mm_cvtsi128_si32(sum_32)
 }
